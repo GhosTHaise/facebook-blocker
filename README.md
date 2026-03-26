@@ -43,3 +43,8 @@ sudo ./block_fb.sh unblock
 ## 📝 License
 
 MIT License
+
+```
+chmod +x block.sh timelimit.sh
+sudo ./timelimit.sh watch --domain facebook.com --limit 180 &
+```
