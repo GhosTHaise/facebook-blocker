@@ -2,32 +2,41 @@
 # ============================================================
 #  ytblock.sh — Schedule-aware YouTube blocker via /etc/hosts
 #
+#  Fixes applied (v2):
+#    • Cron syntax: removed bogus "root" field from user crontab
+#    • reset: now kills daemon + removes cron entries
+#    • /etc/hosts: atomic write via temp file (crash-safe)
+#    • "for" mode: unblock deadline written to disk so a reboot
+#      can still honour it via the _tick / systemd timer path
+#    • Systemd: --install-systemd installs a proper .service +
+#      .timer instead of the bash-daemon / cron approach
+#
 #  Modes
 #  ─────
-#  schedule   Apply a recurring daily window (or two windows)
-#             The daemon checks every minute and blocks/unblocks
-#             automatically.  Restarts survive reboots if you add
-#             the cronjob (see --install-cron).
+#  schedule        Apply a recurring daily window (or two windows).
+#                  Use --install-systemd (recommended) or --install-cron
+#                  to survive reboots.
 #
-#  for        Block YouTube right now for a fixed duration,
-#             then automatically unblock.
+#  for             Block YouTube right now for a fixed duration,
+#                  then automatically unblock (reboot-safe with systemd).
 #
-#  block      Block immediately (no timer).
-#  unblock    Unblock immediately.
-#  status     Show current state + active schedule.
-#  reset      Unblock and wipe saved schedule.
+#  block           Block immediately (no timer).
+#  unblock         Unblock immediately.
+#  status          Show current state + active schedule.
+#  reset           Unblock, stop daemon, remove cron/systemd, wipe state.
 #
 #  Usage examples
 #  ──────────────
 #  # Default two-window schedule (08:00-12:00 and 13:00-17:30), weekdays only
 #  sudo ./ytblock.sh schedule
 #
-#  # One window, including weekends
-#  sudo ./ytblock.sh schedule --from 09:00 --to 18:00 --weekends
-#
-#  # Two custom windows
+#  # Install as a systemd timer (recommended — survives reboots)
 #  sudo ./ytblock.sh schedule --from 08:00 --to 12:00 \
-#                             --from2 14:00 --to2 18:00 --no-weekends
+#                             --from2 13:00 --to2 17:30 \
+#                             --install-systemd
+#
+#  # Install via cron (fallback if systemd unavailable)
+#  sudo ./ytblock.sh schedule --install-cron
 #
 #  # Block for exactly 1 hour right now
 #  sudo ./ytblock.sh for --duration 1h
@@ -39,12 +48,8 @@
 #  sudo ./ytblock.sh block
 #  sudo ./ytblock.sh unblock
 #
-#  # Run scheduler as background daemon
-#  sudo ./ytblock.sh schedule --daemon
-#
-#  # Install a @reboot + minutely cron entry so the scheduler
-#  # survives reboots automatically
-#  sudo ./ytblock.sh schedule --install-cron
+#  # Full teardown
+#  sudo ./ytblock.sh reset
 # ============================================================
 
 set -euo pipefail
@@ -57,8 +62,8 @@ DOMAINS=(
   "youtu.be"
   "youtube-nocookie.com"
   "www.youtube-nocookie.com"
-  "yt3.ggpht.com"           # YouTube thumbnails / avatars
-  "ytimg.com"               # YouTube images (breaks player)
+  "yt3.ggpht.com"
+  "ytimg.com"
   "i.ytimg.com"
   "s.ytimg.com"
 )
@@ -69,15 +74,18 @@ HOSTS_FILE="/etc/hosts"
 MARKER="# managed-by-ytblock.sh"
 STATE_DIR="/var/lib/ytblock"
 SCHEDULE_FILE="$STATE_DIR/schedule.conf"
+FOR_DEADLINE_FILE="$STATE_DIR/for_deadline.conf"
 PID_FILE="/var/run/ytblock.pid"
 LOG_FILE="/var/log/ytblock.log"
+SYSTEMD_SERVICE="/etc/systemd/system/ytblock.service"
+SYSTEMD_TIMER="/etc/systemd/system/ytblock.timer"
 
 # ── Defaults ─────────────────────────────────────────────────
 DEFAULT_FROM1="08:00"
 DEFAULT_TO1="12:00"
 DEFAULT_FROM2="13:00"
 DEFAULT_TO2="17:30"
-DEFAULT_WEEKENDS="no"     # "yes" | "no"
+DEFAULT_WEEKENDS="no"
 
 # ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -88,35 +96,35 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 # ─────────────────────────────────────────────────────────────
 usage() {
   cat <<EOF
-${BOLD}ytblock.sh${RESET} — Schedule-aware YouTube blocker
+${BOLD}ytblock.sh${RESET} — Schedule-aware YouTube blocker (v2)
 
 ${BOLD}MODES${RESET}
-  ${CYAN}schedule${RESET}   Set up / run a recurring daily block schedule
+  ${CYAN}schedule${RESET}   Set up a recurring daily block schedule
   ${CYAN}for${RESET}        Block YouTube for a fixed duration right now
   ${CYAN}block${RESET}      Block YouTube immediately (permanent until unblock)
   ${CYAN}unblock${RESET}    Remove the block immediately
   ${CYAN}status${RESET}     Show block state and active schedule
-  ${CYAN}reset${RESET}      Unblock and delete saved schedule
+  ${CYAN}reset${RESET}      Full teardown: unblock + stop daemon + remove cron/systemd
 
 ${BOLD}SCHEDULE OPTIONS${RESET}
-  --from HH:MM          First window start   (default: $DEFAULT_FROM1)
-  --to   HH:MM          First window end     (default: $DEFAULT_TO1)
-  --from2 HH:MM         Second window start  (default: $DEFAULT_FROM2)
-  --to2   HH:MM         Second window end    (default: $DEFAULT_TO2)
+  --from HH:MM          First window start    (default: $DEFAULT_FROM1)
+  --to   HH:MM          First window end      (default: $DEFAULT_TO1)
+  --from2 HH:MM         Second window start   (default: $DEFAULT_FROM2)
+  --to2   HH:MM         Second window end     (default: $DEFAULT_TO2)
   --no-second-window    Disable the second window
   --weekends            Also apply on Saturday & Sunday
   --no-weekends         Skip Saturday & Sunday (default)
-  --daemon              Fork into the background and run forever
-  --install-cron        Add cron entries so the scheduler auto-starts
+  --install-systemd     Install systemd .service + .timer (recommended)
+  --install-cron        Install cron job (fallback if no systemd)
+  --daemon              Run as a background bash daemon (least preferred)
 
-${BOLD}DURATION OPTIONS (for "for" mode)${RESET}
+${BOLD}DURATION OPTIONS  ("for" mode)${RESET}
   --duration VALUE      e.g. 30m  1h  90m  2h30m
 
 ${BOLD}EXAMPLES${RESET}
-  sudo $0 schedule                              # default two-window, no weekends
-  sudo $0 schedule --from 09:00 --to 17:00 --no-second-window --weekends
-  sudo $0 schedule --from 08:00 --to 12:00 --from2 14:00 --to2 18:00
-  sudo $0 schedule --daemon
+  sudo $0 schedule --install-systemd
+  sudo $0 schedule --from 09:00 --to 17:00 --no-second-window --weekends --install-systemd
+  sudo $0 schedule --from 08:00 --to 12:00 --from2 14:00 --to2 18:00 --install-cron
   sudo $0 for --duration 1h
   sudo $0 for --duration 45m
   sudo $0 block
@@ -135,42 +143,55 @@ require_root() {
 }
 
 log() {
-  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE" 2>/dev/null || true
+  local plain; plain=$(echo -e "$*" | sed 's/\x1B\[[0-9;]*m//g')
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $plain" >> "$LOG_FILE" 2>/dev/null || true
   echo -e "$*"
 }
 
-# ── Host manipulation ─────────────────────────────────────────
+mkdir -p "$STATE_DIR"
+
+# ─────────────────────────────────────────────────────────────
+#  /etc/hosts — atomic, crash-safe manipulation
+#  We write to a temp file then mv (atomic on same filesystem).
+# ─────────────────────────────────────────────────────────────
 is_blocked() {
   grep -q "${MARKER}" "$HOSTS_FILE" 2>/dev/null
 }
 
 do_block() {
   if ! is_blocked; then
+    # Build new content: existing hosts + our entries
+    local tmp; tmp=$(mktemp)
+    cp "$HOSTS_FILE" "$tmp"
     for domain in "${DOMAINS[@]}"; do
-      echo "${REDIRECT_IP} ${domain} ${MARKER}" >> "$HOSTS_FILE"
+      echo "${REDIRECT_IP} ${domain} ${MARKER}" >> "$tmp"
     done
+    # Atomic replace
+    mv "$tmp" "$HOSTS_FILE"
     log "${RED}🔒 YouTube blocked.${RESET}"
   fi
 }
 
 do_unblock() {
   if is_blocked; then
-    sed -i "/${MARKER}/d" "$HOSTS_FILE"
+    local tmp; tmp=$(mktemp)
+    grep -v "${MARKER}" "$HOSTS_FILE" > "$tmp" || true
+    mv "$tmp" "$HOSTS_FILE"
     log "${GREEN}🔓 YouTube unblocked.${RESET}"
   fi
 }
 
-# ── Time helpers ──────────────────────────────────────────────
-# Convert HH:MM to minutes-since-midnight
+# ─────────────────────────────────────────────────────────────
+#  Time helpers
+# ─────────────────────────────────────────────────────────────
 hhmm_to_min() {
   local h m
   IFS=: read -r h m <<< "$1"
   echo $(( 10#$h * 60 + 10#$m ))
 }
 
-# Parse duration strings like 1h, 45m, 2h30m → seconds
 parse_duration() {
-  local raw="$1" secs=0 h=0 m=0
+  local raw="$1" h=0 m=0 secs=0
   if [[ "$raw" =~ ^([0-9]+)h([0-9]+)m$ ]]; then
     h="${BASH_REMATCH[1]}"; m="${BASH_REMATCH[2]}"
   elif [[ "$raw" =~ ^([0-9]+)h$ ]]; then
@@ -187,7 +208,7 @@ parse_duration() {
 }
 
 now_min() {
-  date +%H:%M | { IFS=: read h m; echo $(( 10#$h * 60 + 10#$m )); }
+  date +%H:%M | { IFS=: read -r h m; echo $(( 10#$h * 60 + 10#$m )); }
 }
 
 is_weekend() {
@@ -195,9 +216,10 @@ is_weekend() {
   [[ "$dow" -ge 6 ]]
 }
 
-# ── Schedule persistence ──────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+#  Schedule persistence
+# ─────────────────────────────────────────────────────────────
 save_schedule() {
-  mkdir -p "$STATE_DIR"
   cat > "$SCHEDULE_FILE" <<EOF
 FROM1=$1
 TO1=$2
@@ -219,9 +241,55 @@ load_schedule() {
 }
 
 # ─────────────────────────────────────────────────────────────
+#  Core tick logic — shared by cron, systemd, and daemon loop
+# ─────────────────────────────────────────────────────────────
+evaluate_and_apply() {
+  # 1. Check "for" deadline first — it takes priority
+  if [[ -f "$FOR_DEADLINE_FILE" ]]; then
+    local deadline; deadline=$(cat "$FOR_DEADLINE_FILE")
+    local now_ts; now_ts=$(date +%s)
+    if (( now_ts < deadline )); then
+      do_block
+      return
+    else
+      # Deadline passed — clean up and fall through to schedule logic
+      rm -f "$FOR_DEADLINE_FILE"
+      log "${GREEN}✓ Fixed-duration block expired.${RESET}"
+    fi
+  fi
+
+  # 2. No saved schedule → leave hosts as-is
+  [[ -f "$SCHEDULE_FILE" ]] || return
+
+  source "$SCHEDULE_FILE"
+  local from1="${FROM1}" to1="${TO1}"
+  local from2="${FROM2}" to2="${TO2}"
+  local second_window="${SECOND_WINDOW:-yes}"
+  local weekends="${WEEKENDS:-no}"
+
+  local from1_m; from1_m=$(hhmm_to_min "$from1")
+  local to1_m;   to1_m=$(hhmm_to_min "$to1")
+  local from2_m; from2_m=$(hhmm_to_min "$from2")
+  local to2_m;   to2_m=$(hhmm_to_min "$to2")
+  local now;     now=$(now_min)
+
+  local should_block=0
+
+  if is_weekend && [[ "$weekends" == "no" ]]; then
+    should_block=0
+  else
+    (( now >= from1_m && now < to1_m )) && should_block=1
+    if [[ "$second_window" == "yes" ]] && (( now >= from2_m && now < to2_m )); then
+      should_block=1
+    fi
+  fi
+
+  if [[ "$should_block" -eq 1 ]]; then do_block; else do_unblock; fi
+}
+
+# ─────────────────────────────────────────────────────────────
 #  Commands
 # ─────────────────────────────────────────────────────────────
-
 cmd_block() {
   require_root
   do_block
@@ -229,46 +297,99 @@ cmd_block() {
 
 cmd_unblock() {
   require_root
+  rm -f "$FOR_DEADLINE_FILE"   # Cancel any active "for" timer
   do_unblock
 }
 
 cmd_status() {
   echo -e "${BOLD}── YouTube Blocker Status ──────────────────────${RESET}"
   if is_blocked; then
-    echo -e "  Blocked : ${RED}YES${RESET}"
+    echo -e "  Blocked     : ${RED}YES${RESET}"
   else
-    echo -e "  Blocked : ${GREEN}no${RESET}"
+    echo -e "  Blocked     : ${GREEN}no${RESET}"
+  fi
+
+  if [[ -f "$FOR_DEADLINE_FILE" ]]; then
+    local deadline; deadline=$(cat "$FOR_DEADLINE_FILE")
+    local now_ts;   now_ts=$(date +%s)
+    if (( now_ts < deadline )); then
+      local remaining=$(( deadline - now_ts ))
+      local human_end; human_end=$(date -d "@$deadline" '+%H:%M:%S' 2>/dev/null \
+                                   || date -r "$deadline" '+%H:%M:%S' 2>/dev/null)
+      echo -e "  \"for\" timer : active — unblocks at ${human_end} ($(( remaining/60 ))m $(( remaining%60 ))s left)"
+    else
+      echo -e "  \"for\" timer : expired"
+    fi
   fi
 
   if [[ -f "$SCHEDULE_FILE" ]]; then
     source "$SCHEDULE_FILE"
     echo -e "\n  ${BOLD}Saved schedule:${RESET}"
-    echo -e "  Window 1  : ${FROM1} → ${TO1}"
+    echo -e "  Window 1    : ${FROM1} → ${TO1}"
     if [[ "${SECOND_WINDOW:-yes}" == "yes" ]]; then
-      echo -e "  Window 2  : ${FROM2} → ${TO2}"
+      echo -e "  Window 2    : ${FROM2} → ${TO2}"
     else
-      echo -e "  Window 2  : (disabled)"
+      echo -e "  Window 2    : (disabled)"
     fi
-    echo -e "  Weekends  : ${WEEKENDS:-no}"
+    echo -e "  Weekends    : ${WEEKENDS:-no}"
   else
     echo -e "\n  ${YELLOW}No saved schedule.${RESET}"
   fi
 
+  # Systemd
+  if systemctl is-active --quiet ytblock.timer 2>/dev/null; then
+    echo -e "  Systemd     : ${GREEN}timer active${RESET}"
+  elif [[ -f "$SYSTEMD_TIMER" ]]; then
+    echo -e "  Systemd     : ${YELLOW}installed but not active${RESET}"
+  fi
+
+  # Bash daemon
   if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    echo -e "  Daemon    : running (PID $(cat "$PID_FILE"))"
-  else
-    echo -e "  Daemon    : ${YELLOW}not running${RESET}"
+    echo -e "  Bash daemon : running (PID $(cat "$PID_FILE"))"
+  fi
+
+  # Cron
+  if crontab -l 2>/dev/null | grep -q "ytblock"; then
+    echo -e "  Cron        : ${GREEN}entry present${RESET}"
   fi
 }
 
+# ── reset: full teardown ──────────────────────────────────────
 cmd_reset() {
   require_root
+
+  # 1. Unblock hosts
+  rm -f "$FOR_DEADLINE_FILE"
   do_unblock
+
+  # 2. Kill bash daemon
+  if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    kill "$(cat "$PID_FILE")"
+    echo -e "${YELLOW}↺  Stopped background daemon (PID $(cat "$PID_FILE")).${RESET}"
+  fi
+
+  # 3. Remove systemd units
+  if [[ -f "$SYSTEMD_TIMER" ]] || [[ -f "$SYSTEMD_SERVICE" ]]; then
+    systemctl stop  ytblock.timer ytblock.service 2>/dev/null || true
+    systemctl disable ytblock.timer               2>/dev/null || true
+    rm -f "$SYSTEMD_TIMER" "$SYSTEMD_SERVICE"
+    systemctl daemon-reload
+    echo -e "${YELLOW}↺  Removed systemd units.${RESET}"
+  fi
+
+  # 4. Remove cron entries (root's crontab)
+  if crontab -l 2>/dev/null | grep -q "ytblock"; then
+    crontab -l 2>/dev/null | grep -v "ytblock" | crontab -
+    echo -e "${YELLOW}↺  Removed cron entries.${RESET}"
+  fi
+
+  # 5. Wipe state files
   rm -f "$SCHEDULE_FILE" "$PID_FILE"
-  echo -e "${GREEN}✓ YouTube unblocked and schedule wiped.${RESET}"
+
+  echo -e "${GREEN}✓ Full reset complete. YouTube unblocked, all automation removed.${RESET}"
 }
 
-# ── "for" mode: block for a fixed duration ────────────────────
+# ── "for" mode ────────────────────────────────────────────────
 cmd_for() {
   require_root
   local duration=""
@@ -283,76 +404,78 @@ cmd_for() {
   [[ -n "$duration" ]] || { echo -e "${RED}✗ --duration required.${RESET}"; usage; }
   local secs; secs=$(parse_duration "$duration")
 
+  # Write deadline to disk — survives reboots
+  local deadline=$(( $(date +%s) + secs ))
+  echo "$deadline" > "$FOR_DEADLINE_FILE"
+
   do_block
 
-  local end_ts=$(( $(date +%s) + secs ))
-  local human_end; human_end=$(date -d "@$end_ts" '+%H:%M:%S' 2>/dev/null \
-                               || date -r "$end_ts" '+%H:%M:%S' 2>/dev/null)
+  local human_end; human_end=$(date -d "@$deadline" '+%H:%M:%S' 2>/dev/null \
+                               || date -r "$deadline" '+%H:%M:%S' 2>/dev/null)
+  echo -e "  ${BOLD}YouTube blocked for ${duration}${RESET} — unblocks at ${human_end}"
 
-  echo -e "  ${BOLD}YouTube blocked for ${duration}${RESET} — unblocking at ${human_end}"
-  echo -e "  (sleeping in background; PID $$)"
-
-  # Background waiter
-  (
-    sleep "$secs"
-    do_unblock
-    log "${GREEN}✓ Fixed-duration block expired — YouTube unblocked.${RESET}"
-  ) &
-  disown
+  if systemctl is-active --quiet ytblock.timer 2>/dev/null; then
+    echo -e "  ${CYAN}ℹ The systemd timer will handle the unblock automatically.${RESET}"
+  else
+    echo -e "  ${YELLOW}⚠ No systemd timer active. Running background waiter (not reboot-safe).${RESET}"
+    echo -e "    Install the timer with: sudo $0 schedule --install-systemd"
+    (
+      sleep "$secs"
+      rm -f "$FOR_DEADLINE_FILE"
+      do_unblock
+      log "${GREEN}✓ Fixed-duration block expired — YouTube unblocked.${RESET}"
+    ) &
+    disown
+  fi
 }
 
-# ── schedule daemon loop ──────────────────────────────────────
-run_scheduler() {
-  local from1 to1 from2 to2 second_window weekends
-  load_schedule
-  from1="$FROM1"; to1="$TO1"
-  from2="$FROM2"; to2="$TO2"
-  second_window="${SECOND_WINDOW:-yes}"
-  weekends="${WEEKENDS:-no}"
+# ── systemd install ───────────────────────────────────────────
+install_systemd() {
+  local script_path; script_path="$(realpath "$0")"
 
+  cat > "$SYSTEMD_SERVICE" <<EOF
+[Unit]
+Description=YouTube blocker — evaluate schedule
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$script_path _tick
+StandardOutput=append:$LOG_FILE
+StandardError=append:$LOG_FILE
+EOF
+
+  cat > "$SYSTEMD_TIMER" <<EOF
+[Unit]
+Description=YouTube blocker — run every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now ytblock.timer
+  echo -e "${GREEN}✓ Systemd timer installed and started.${RESET}"
+  echo -e "  Check with : systemctl status ytblock.timer"
+  echo -e "  Logs       : journalctl -u ytblock.service  or  tail $LOG_FILE"
+}
+
+# ── bash daemon loop ──────────────────────────────────────────
+run_scheduler_loop() {
   echo $$ > "$PID_FILE"
-  log "${BOLD}⏱  Scheduler running (PID $$)${RESET}"
-  log "   Window 1 : $from1 → $to1"
-  [[ "$second_window" == "yes" ]] && log "   Window 2 : $from2 → $to2"
-  log "   Weekends : $weekends"
-
-  local from1_m; from1_m=$(hhmm_to_min "$from1")
-  local to1_m;   to1_m=$(hhmm_to_min "$to1")
-  local from2_m; from2_m=$(hhmm_to_min "$from2")
-  local to2_m;   to2_m=$(hhmm_to_min "$to2")
-
+  log "${BOLD}⏱  Bash scheduler daemon running (PID $$)${RESET}"
   while true; do
-    local now; now=$(now_min)
-
-    # Weekend check
-    local skip=0
-    if is_weekend && [[ "$weekends" == "no" ]]; then
-      skip=1
-    fi
-
-    local should_block=0
-    if [[ "$skip" -eq 0 ]]; then
-      # Window 1
-      if (( now >= from1_m && now < to1_m )); then
-        should_block=1
-      fi
-      # Window 2
-      if [[ "$second_window" == "yes" ]] && (( now >= from2_m && now < to2_m )); then
-        should_block=1
-      fi
-    fi
-
-    if [[ "$should_block" -eq 1 ]]; then
-      do_block
-    else
-      do_unblock
-    fi
-
+    evaluate_and_apply
     sleep 60
   done
 }
 
-# ── "schedule" command: parse args, save, optionally daemonise ─
+# ── "schedule" command ────────────────────────────────────────
 cmd_schedule() {
   require_root
 
@@ -362,88 +485,70 @@ cmd_schedule() {
   local weekends="$DEFAULT_WEEKENDS"
   local daemon=0
   local install_cron=0
+  local install_systemd_flag=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --from)              from1="$2";         shift 2 ;;
-      --to)                to1="$2";           shift 2 ;;
-      --from2)             from2="$2";         shift 2 ;;
-      --to2)               to2="$2";           shift 2 ;;
-      --no-second-window)  second_window="no"; shift   ;;
-      --weekends)          weekends="yes";     shift   ;;
-      --no-weekends)       weekends="no";      shift   ;;
-      --daemon)            daemon=1;           shift   ;;
-      --install-cron)      install_cron=1;     shift   ;;
+      --from)              from1="$2";              shift 2 ;;
+      --to)                to1="$2";                shift 2 ;;
+      --from2)             from2="$2";              shift 2 ;;
+      --to2)               to2="$2";                shift 2 ;;
+      --no-second-window)  second_window="no";      shift   ;;
+      --weekends)          weekends="yes";           shift   ;;
+      --no-weekends)       weekends="no";            shift   ;;
+      --daemon)            daemon=1;                 shift   ;;
+      --install-cron)      install_cron=1;           shift   ;;
+      --install-systemd)   install_systemd_flag=1;  shift   ;;
       *) echo -e "${RED}Unknown option: $1${RESET}"; usage ;;
     esac
   done
 
-  # Validate HH:MM format
+  # Validate HH:MM
   local re='^([01][0-9]|2[0-3]):[0-5][0-9]$'
   for t in "$from1" "$to1" "$from2" "$to2"; do
     [[ "$t" =~ $re ]] || {
-      echo -e "${RED}✗ Invalid time: $t  (expected HH:MM)${RESET}"
+      echo -e "${RED}✗ Invalid time: $t  (expected HH:MM, e.g. 08:00)${RESET}"
       exit 1
     }
   done
 
   save_schedule "$from1" "$to1" "$from2" "$to2" "$second_window" "$weekends"
 
-  # ── Install cron ─────────────────────────────────────────────
-  if [[ "$install_cron" -eq 1 ]]; then
-    local script_path; script_path="$(realpath "$0")"
-    # Remove old entries
-    crontab -l 2>/dev/null | grep -v "ytblock.sh" | crontab - || true
-    # Add: run every minute + at reboot
-    (
-      crontab -l 2>/dev/null || true
-      echo "* * * * * root $script_path _tick >> $LOG_FILE 2>&1"
-      echo "@reboot    root $script_path _tick >> $LOG_FILE 2>&1"
-    ) | crontab -
-    echo -e "${GREEN}✓ Cron entries installed. Scheduler will run every minute.${RESET}"
+  # ── Systemd (recommended) ─────────────────────────────────
+  if [[ "$install_systemd_flag" -eq 1 ]]; then
+    install_systemd
     return
   fi
 
-  # ── Daemon mode ──────────────────────────────────────────────
+  # ── Cron (fallback) ───────────────────────────────────────
+  if [[ "$install_cron" -eq 1 ]]; then
+    local script_path; script_path="$(realpath "$0")"
+    # Remove old ytblock cron entries, then append new ones
+    # FIX: no "root" field — this is a personal (root user) crontab
+    (
+      crontab -l 2>/dev/null | grep -v "ytblock" || true
+      echo "* * * * * $script_path _tick >> $LOG_FILE 2>&1"
+      echo "@reboot    $script_path _tick >> $LOG_FILE 2>&1"
+    ) | crontab -
+    echo -e "${GREEN}✓ Cron entries installed (no 'root' field — correct for user crontab).${RESET}"
+    echo -e "  Verify with: sudo crontab -l | grep ytblock"
+    return
+  fi
+
+  # ── Bash daemon ───────────────────────────────────────────
   if [[ "$daemon" -eq 1 ]]; then
-    # Kill previous daemon if any
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-      kill "$(cat "$PID_FILE")" && echo -e "${YELLOW}↺ Stopped previous daemon.${RESET}"
+      kill "$(cat "$PID_FILE")"
+      echo -e "${YELLOW}↺ Stopped previous daemon.${RESET}"
     fi
     nohup "$0" _run_scheduler >> "$LOG_FILE" 2>&1 &
     disown
-    echo -e "${GREEN}✓ Scheduler daemon started (PID $!). Logs: $LOG_FILE${RESET}"
+    echo -e "${GREEN}✓ Bash daemon started (PID $!). Logs: $LOG_FILE${RESET}"
+    echo -e "  ${YELLOW}⚠ This does NOT survive reboots. Use --install-systemd instead.${RESET}"
   else
-    # Foreground mode
-    run_scheduler
+    # Foreground
+    run_scheduler_loop
   fi
-}
-
-# Internal: one-shot tick for cron usage
-cmd_tick() {
-  load_schedule
-  local from1="$FROM1" to1="$TO1" from2="$FROM2" to2="$TO2"
-  local second_window="${SECOND_WINDOW:-yes}"
-  local weekends="${WEEKENDS:-no}"
-
-  local from1_m; from1_m=$(hhmm_to_min "$from1")
-  local to1_m;   to1_m=$(hhmm_to_min "$to1")
-  local from2_m; from2_m=$(hhmm_to_min "$from2")
-  local to2_m;   to2_m=$(hhmm_to_min "$to2")
-  local now;     now=$(now_min)
-
-  local skip=0
-  is_weekend && [[ "$weekends" == "no" ]] && skip=1
-
-  local should_block=0
-  if [[ "$skip" -eq 0 ]]; then
-    (( now >= from1_m && now < to1_m )) && should_block=1
-    if [[ "$second_window" == "yes" ]] && (( now >= from2_m && now < to2_m )); then
-      should_block=1
-    fi
-  fi
-
-  if [[ "$should_block" -eq 1 ]]; then do_block; else do_unblock; fi
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -453,13 +558,13 @@ ACTION="${1:-}"
 shift 2>/dev/null || true
 
 case "$ACTION" in
-  schedule)       cmd_schedule "$@" ;;
-  for)            cmd_for      "$@" ;;
-  block)          cmd_block ;;
-  unblock)        cmd_unblock ;;
-  status)         cmd_status ;;
-  reset)          cmd_reset ;;
-  _run_scheduler) run_scheduler ;;   # internal: daemon entry point
-  _tick)          cmd_tick ;;        # internal: cron entry point
-  *)              usage ;;
+  schedule)        cmd_schedule "$@" ;;
+  for)             cmd_for      "$@" ;;
+  block)           cmd_block ;;
+  unblock)         cmd_unblock ;;
+  status)          cmd_status ;;
+  reset)           cmd_reset ;;
+  _run_scheduler)  run_scheduler_loop ;;   # internal: bash daemon entry
+  _tick)           require_root; evaluate_and_apply ;;  # internal: cron/systemd
+  *)               usage ;;
 esac
