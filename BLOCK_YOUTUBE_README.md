@@ -8,20 +8,20 @@
 **Schedule options**
 ```bash
 # Default: 08:00-12:00 and 13:00-17:30, weekdays only
-sudo ./ytblock.sh schedule
+sudo ./block_youtube.sh schedule
 
 # One window, weekends included
-sudo ./ytblock.sh schedule --from 09:00 --to 18:00 --no-second-window --weekends
+sudo ./block_youtube.sh schedule --from 09:00 --to 18:00 --no-second-window --weekends
 
 # Two custom windows, no weekends
-sudo ./ytblock.sh schedule --from 08:00 --to 12:00 --from2 14:00 --to2 18:00 --no-weekends
+sudo ./block_youtube.sh schedule --from 08:00 --to 12:00 --from2 14:00 --to2 18:00 --no-weekends
 ```
 
 **Duration mode**
 ```bash
-sudo ./ytblock.sh for --duration 1h
-sudo ./ytblock.sh for --duration 45m
-sudo ./ytblock.sh for --duration 2h30m
+sudo ./block_youtube.sh for --duration 1h
+sudo ./block_youtube.sh for --duration 45m
+sudo ./block_youtube.sh for --duration 2h30m
 ```
 
 **Surviving reboots** — use `--install-cron` once; it adds a `* * * * *` cron job + a `@reboot` entry so the schedule is enforced automatically without you having to restart the daemon manually.
@@ -34,9 +34,9 @@ You already have two clean ways to disable it:
 
 **Stop the schedule + unblock immediately**
 ```bash
-sudo ./ytblock.sh unblock
+sudo ./block_youtube.sh unblock
 ```
-This removes all the `ytblock.sh` entries from `/etc/hosts` instantly. YouTube works again. The saved schedule stays on disk so you can resume later.
+This removes all the `block_youtube.sh` entries from `/etc/hosts` instantly. YouTube works again. The saved schedule stays on disk so you can resume later.
 
 **Stop the daemon too**
 ```bash
@@ -44,12 +44,12 @@ This removes all the `ytblock.sh` entries from `/etc/hosts` instantly. YouTube w
 sudo kill $(cat /var/run/ytblock.pid)
 
 # Then unblock
-sudo ./ytblock.sh unblock
+sudo ./block_youtube.sh unblock
 ```
 
 **Nuke everything (schedule + block + cron)**
 ```bash
-sudo ./ytblock.sh reset
+sudo ./block_youtube.sh reset
 ```
 Then if you installed the cron entries:
 ```bash
@@ -64,6 +64,6 @@ grep ytblock /etc/hosts
 
 Nothing irreversible is ever done — no iptables rules, no DNS server changes, no system config files modified outside of `/etc/hosts`. If you ever delete the script entirely without unblocking first, you can still manually clean up with:
 ```bash
-sudo sed -i '/managed-by-ytblock.sh/d' /etc/hosts
+sudo sed -i '/managed-by-block_youtube.sh/d' /etc/hosts
 ```
 And YouTube comes back immediately. That's your nuclear fallback that requires zero dependency on the script.

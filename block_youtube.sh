@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-#  ytblock.sh — Schedule-aware YouTube blocker via /etc/hosts
+#  block_youtube.sh — Schedule-aware YouTube blocker via /etc/hosts
 #
 #  Fixes applied (v2):
 #    • Cron syntax: removed bogus "root" field from user crontab
@@ -28,28 +28,28 @@
 #  Usage examples
 #  ──────────────
 #  # Default two-window schedule (08:00-12:00 and 13:00-17:30), weekdays only
-#  sudo ./ytblock.sh schedule
+#  sudo ./block_youtube.sh schedule
 #
 #  # Install as a systemd timer (recommended — survives reboots)
-#  sudo ./ytblock.sh schedule --from 08:00 --to 12:00 \
+#  sudo ./block_youtube.sh schedule --from 08:00 --to 12:00 \
 #                             --from2 13:00 --to2 17:30 \
 #                             --install-systemd
 #
 #  # Install via cron (fallback if systemd unavailable)
-#  sudo ./ytblock.sh schedule --install-cron
+#  sudo ./block_youtube.sh schedule --install-cron
 #
 #  # Block for exactly 1 hour right now
-#  sudo ./ytblock.sh for --duration 1h
+#  sudo ./block_youtube.sh for --duration 1h
 #
 #  # Block for 45 minutes right now
-#  sudo ./ytblock.sh for --duration 45m
+#  sudo ./block_youtube.sh for --duration 45m
 #
 #  # One-shot block/unblock
-#  sudo ./ytblock.sh block
-#  sudo ./ytblock.sh unblock
+#  sudo ./block_youtube.sh block
+#  sudo ./block_youtube.sh unblock
 #
 #  # Full teardown
-#  sudo ./ytblock.sh reset
+#  sudo ./block_youtube.sh reset
 # ============================================================
 
 set -euo pipefail
@@ -71,7 +71,7 @@ DOMAINS=(
 # ── Config ───────────────────────────────────────────────────
 REDIRECT_IP="127.0.0.1"
 HOSTS_FILE="/etc/hosts"
-MARKER="# managed-by-ytblock.sh"
+MARKER="# managed-by-block_youtube.sh"
 STATE_DIR="/var/lib/ytblock"
 SCHEDULE_FILE="$STATE_DIR/schedule.conf"
 FOR_DEADLINE_FILE="$STATE_DIR/for_deadline.conf"
@@ -96,7 +96,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 # ─────────────────────────────────────────────────────────────
 usage() {
   cat <<EOF
-${BOLD}ytblock.sh${RESET} — Schedule-aware YouTube blocker (v2)
+${BOLD}block_youtube.sh${RESET} — Schedule-aware YouTube blocker (v2)
 
 ${BOLD}MODES${RESET}
   ${CYAN}schedule${RESET}   Set up a recurring daily block schedule
